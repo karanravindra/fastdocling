@@ -30,6 +30,8 @@ decode greedily and never need it.
 from __future__ import annotations
 
 import os
+import queue
+import threading
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
@@ -75,21 +77,22 @@ def _register_eagle3_shim() -> None:
     register()
 
 
-# How many pages to hand vLLM per generate() call.  A call returns only when its slowest
-# page does, so small chunks throttle the GPU (it drains to one active sequence and waits);
-# but throughput does *not* rise monotonically with size.  Measured on 72 pages / one 5070 Ti,
-# wall time net of engine start:
+# How many pages stay resident in the engine at once.  Under ``_stream_requests`` this is a
+# steady-state concurrency level, not a chunk size: a finished page is replaced immediately,
+# so there is no drain and no boundary stall, and it does not bound crash-loss either
+# (traces are saved as each page lands).
 #
-#     gen-batch      8     16     32     64     72 (all at once)
-#     seconds      122     91     69     58    136
+# It still sets throughput, because it sets how many sequences decode together.  Measured on
+# 200 random corpus pages / one 5070 Ti, wall seconds including ~45 s of engine start:
 #
-# The cliff past ~64 is most likely the vision encoder cache -- vLLM reports an 8192-token
-# encoder budget and each page's image expands to ~800+ tokens, so roughly nine images of
-# encoder output fit at once and oversubscribing forces re-encoding.  Chunked prefill is off
-# (the feature requires it), which removes the usual smoothing.  Re-tune if the image size,
-# the model, or gpu_memory_utilization changes; the numbers above carry run-to-run variance
-# of roughly 25%, so treat 64 as "a good plateau" rather than a sharp optimum.
-VLLM_CHUNK = 64
+#     concurrency     32     64    128
+#     seconds        139    125    121
+#
+# Still rising at 128 rather than plateauing, so there may be more here -- but raising
+# max_num_batched_tokens (which sets the encoder budget) costs activation memory, and 32768
+# OOMs on a 16 GB card.  Re-sweep both together if you move to a bigger GPU.  Run-to-run
+# variance is ~25%, so treat these as a gradient, not exact figures.
+VLLM_CHUNK = 128
 
 
 class VLLMBackend:
@@ -101,7 +104,7 @@ class VLLMBackend:
                  taps: Sequence[int] | None = None, *, keep_taps: bool = False,
                  storage_path: str | None = None, gpu_memory_utilization: float = 0.85,
                  max_model_len: int = MAX_NEW_TOKENS, enforce_eager: bool = False,
-                 read_workers: int = 8):
+                 read_workers: int = 8, max_num_batched_tokens: int = 16384):
         os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
         # Anything that touched torch.cuda in this process (backend detection does)
         # poisons a forked EngineCore: "Cannot re-initialize CUDA in forked subprocess".
@@ -146,6 +149,11 @@ class VLLMBackend:
                 "kv_connector_extra_config": {"shared_storage_path": self._storage},
             },
             enable_chunked_prefill=False,     # incompatible with hidden-state extraction
+            # This is also the encoder cache budget: vLLM sets both encoder_cache_size and
+            # max_num_encoder_input_tokens from it (config/scheduler.py).  Each page's image
+            # expands to ~800+ vision tokens, so the 8192 default holds only ~9 images and
+            # throttles how fast pages can be admitted -- the batch starves before it fills.
+            max_num_batched_tokens=max_num_batched_tokens,
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
             enforce_eager=enforce_eager,
@@ -197,24 +205,85 @@ class VLLMBackend:
         cleanup_hidden_states(path)
         return hs, ids
 
-    def _drain(self, jobs: list) -> Iterator[tuple[int, Trace]]:
-        """Read + convert a finished chunk's pages in parallel, yielding as they land.
+    def _read_one(self, idx: int, path: str, prompt_len: int, extra: dict) -> tuple[int, Trace]:
+        """Turn one finished request's handoff file into a trace.  Runs on a worker thread."""
+        hs, ids = self._read_states(path)
+        trace = self._to_trace(hs, ids, prompt_len)
+        trace.update(extra)
+        return idx, trace
 
-        Each page is an flock wait, a safetensors load and an unlink; done serially they
-        stack up between generate() calls while the GPU has nothing to do.  safetensors and
-        torch release the GIL, so threads actually overlap here.
+    def _stream_requests(self, items: Iterable[tuple], params, concurrency: int, finish
+                         ) -> Iterator[tuple[int, Trace]]:
+        """Keep ``concurrency`` requests resident in the engine, yielding pages as they finish.
+
+        The obvious loop -- ``llm.generate(chunk)`` per chunk -- wastes the GPU twice over: a
+        call returns only when its slowest page does, so the batch drains to a handful of
+        stragglers, and then the GPU sits at 0% while the chunk's hidden-state files are read
+        back.  Measured on this corpus that was a sawtooth between 99% and 61% with a full
+        stall at every boundary.
+
+        Driving ``add_request``/``step`` directly instead means a finished page is replaced
+        immediately, so the batch never drains and file I/O overlaps the next step.  Images
+        are pulled by a feeder thread because loading a PNG inside the step loop would stall
+        it, and reads run on a pool whose results are handed back only when already done.
+
+        ``items`` yields ``(index, prompt, aux)``; ``finish(out, aux)`` returns
+        ``(prompt_len, extra_trace_keys)``.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
 
-        def one(idx: int, path: str, prompt_len: int, extra: dict) -> tuple[int, Trace]:
-            hs, ids = self._read_states(path)
-            trace = self._to_trace(hs, ids, prompt_len)
-            trace.update(extra)
-            return idx, trace
+        engine = self.llm.llm_engine
+        buf: queue.Queue = queue.Queue(maxsize=max(4, concurrency))
+        DONE = object()
 
+        def feed():
+            try:
+                for item in items:
+                    buf.put(item)
+            finally:
+                buf.put(DONE)
+
+        feeder = threading.Thread(target=feed, daemon=True)
+        feeder.start()
+
+        inflight: dict[str, tuple[int, object]] = {}
+        futures: list = []
+        exhausted = False
         with ThreadPoolExecutor(max_workers=self.read_workers) as pool:
-            futures = [pool.submit(one, *j) for j in jobs]
-            for f in as_completed(futures):
+            while True:
+                # Top up.  Block for the next page only when the engine would otherwise have
+                # nothing to run; otherwise take what the feeder has ready and go step.
+                while not exhausted and len(inflight) < concurrency:
+                    try:
+                        item = buf.get(block=not inflight)
+                    except queue.Empty:
+                        break
+                    if item is DONE:
+                        exhausted = True
+                        break
+                    idx, prompt, aux = item
+                    rid = str(idx)
+                    engine.add_request(rid, prompt, params)
+                    inflight[rid] = (idx, aux)
+
+                if not inflight:
+                    break
+
+                for out in engine.step():
+                    if not out.finished:
+                        continue
+                    idx, aux = inflight.pop(out.request_id)
+                    prompt_len, extra = finish(out, aux)
+                    futures.append(pool.submit(
+                        self._read_one, idx, out.kv_transfer_params["hidden_states_path"],
+                        prompt_len, extra))
+
+                # Hand back completed I/O without blocking the step loop.
+                for f in [f for f in futures if f.done()]:
+                    futures.remove(f)
+                    yield f.result()
+
+            for f in futures:
                 yield f.result()
 
     def _to_trace(self, hs: torch.Tensor, ids: torch.Tensor, prompt_len: int) -> Trace:
@@ -231,31 +300,26 @@ class VLLMBackend:
     # -- teacher-forced ------------------------------------------------------------------
     def extract(self, items: Iterable[tuple[object, str]], batch_size: int = VLLM_CHUNK
                 ) -> Iterator[tuple[int, Trace]]:
-        """One prefill per ``(image, gold doctags)`` page; vLLM batches internally."""
+        """One prefill per ``(image, gold doctags)`` page, ``batch_size`` resident at a time."""
         from vllm import SamplingParams
 
-        items = list(items)
-        for start in range(0, len(items), batch_size):
-            chunk = items[start : start + batch_size]
-            prompts = [
-                {"prompt": self.prompt + dt, "multi_modal_data": {"image": img}}
-                for img, dt in chunk
-            ]
-            outs = self.llm.generate(
-                prompts,
-                SamplingParams(temperature=0.0, max_tokens=1, skip_special_tokens=False,
-                               extra_args={"kv_transfer_params": {}}),
-            )
-            jobs = []
-            for local, (out, (img, dt)) in enumerate(zip(outs, chunk)):
-                # The completion is appended last, so its token count locates the boundary
-                # without re-running the (expensive) image processor on every page.
-                n_dt = len(self.tokenizer.encode(dt, add_special_tokens=False))
-                prompt_len = len(out.prompt_token_ids) - n_dt
-                self._check_boundary_once(img, prompt_len)
-                jobs.append((start + local, out.kv_transfer_params["hidden_states_path"],
-                             prompt_len, {}))
-            yield from self._drain(jobs)
+        params = SamplingParams(temperature=0.0, max_tokens=1, skip_special_tokens=False,
+                                extra_args={"kv_transfer_params": {}})
+
+        def requests():
+            for i, (img, dt) in enumerate(items):
+                yield i, {"prompt": self.prompt + dt, "multi_modal_data": {"image": img}}, (img, dt)
+
+        def finish(out, aux):
+            img, dt = aux
+            # The completion is appended last, so its token count locates the boundary
+            # without re-running the (expensive) image processor on every page.
+            prompt_len = len(out.prompt_token_ids) - len(
+                self.tokenizer.encode(dt, add_special_tokens=False))
+            self._check_boundary_once(img, prompt_len)
+            return prompt_len, {}
+
+        yield from self._stream_requests(requests(), params, batch_size, finish)
 
     def _check_boundary_once(self, image, prompt_len: int) -> None:
         """Verify the prompt/completion split against the processor, for the first page only.
@@ -288,26 +352,23 @@ class VLLMBackend:
         """
         from vllm import SamplingParams
 
-        images = list(images)
-        for start in range(0, len(images), batch_size):
-            chunk = images[start : start + batch_size]
-            prompts = [{"prompt": self.prompt, "multi_modal_data": {"image": img}} for img in chunk]
-            outs = self.llm.generate(
-                prompts,
-                # skip_special_tokens=False is load-bearing: DocTags markup (</text>,
-                # </doctag>) is *special* in this tokenizer, so the default detokenizer
-                # silently strips the entire structure and leaves only running text.
-                # Generation ends on EOS, which the model emits right after </doctag>.
-                SamplingParams(temperature=0.0, max_tokens=max_tokens, skip_special_tokens=False,
-                               extra_args={"kv_transfer_params": {"include_output_tokens": True}}),
-            )
-            jobs = []
-            for local, out in enumerate(outs):
-                text = out.outputs[0].text
-                jobs.append((start + local, out.kv_transfer_params["hidden_states_path"],
-                             len(out.prompt_token_ids),
-                             {"doctags": clip_to_end_tag(text), "truncated": END_TAG not in text}))
-            yield from self._drain(jobs)
+        # skip_special_tokens=False is load-bearing: DocTags markup (</text>, </doctag>) is
+        # *special* in this tokenizer, so the default detokenizer silently strips the entire
+        # structure and leaves only running text.  Generation ends on EOS, which the model
+        # emits right after </doctag>.
+        params = SamplingParams(temperature=0.0, max_tokens=max_tokens, skip_special_tokens=False,
+                                extra_args={"kv_transfer_params": {"include_output_tokens": True}})
+
+        def requests():
+            for i, img in enumerate(images):
+                yield i, {"prompt": self.prompt, "multi_modal_data": {"image": img}}, None
+
+        def finish(out, _aux):
+            text = out.outputs[0].text
+            return len(out.prompt_token_ids), {
+                "doctags": clip_to_end_tag(text), "truncated": END_TAG not in text}
+
+        yield from self._stream_requests(requests(), params, batch_size, finish)
 
     # -- persistence ---------------------------------------------------------------------
     def save(self, path: Path, trace: Trace) -> None:
