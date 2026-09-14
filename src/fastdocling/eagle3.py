@@ -149,9 +149,17 @@ def export_eagle3_checkpoint(
 ) -> Path:
     """Write ``draft`` as a directory vLLM loads with ``method="eagle3"``.
 
-    ``share_embeddings`` (default) omits ``embed_tokens``/``lm_head`` so vLLM binds the target's,
-    which is what this project wants -- both are frozen -- and cuts the drafter from 121M
-    parameters to ~6M.
+    ``share_embeddings`` (default) omits any tensor vLLM can bind from the target instead, which
+    is what this project wants -- the target's embedding and vocabulary projection are frozen and
+    the draft never trains its own.
+
+    The two are decided **separately**, because they are separate tensors.  vLLM sets
+    ``has_own_embed_tokens`` and ``has_own_lm_head`` independently as it reads the checkpoint
+    (``process_eagle_weight``) and consults them independently when binding (``_should_share``).
+    So a pruned draft vocabulary, which does need its own ``lm_head``, does *not* drag the
+    embedding along with it: ``embed_tokens`` stays shared.  Coupling them is expensive -- the
+    embedding is [vocab, hidden], 57.8M parameters at 100,352 x 576, which was 72% of an exported
+    drafter and cost ~0.6 ms per drafted round for nothing.
 
     ``vocab`` is the sorted array of token ids the draft may propose.  It is written as ``d2t``,
     the *offset* form vLLM expects (``target_id = draft_id + d2t[draft_id]``), and the head must
@@ -180,18 +188,21 @@ def export_eagle3_checkpoint(
     if draft.fc is not None:
         tensors["fc.weight"] = cast(draft.fc.weight)
 
-    # Omitting embed_tokens/lm_head makes vLLM bind the *target's* own tensors instead
-    # (``_should_share`` in the eagle loader returns True when the draft ships no copy).  That is
-    # both correct here -- this project freezes the target's embedding and vocabulary projection
-    # and never trains its own -- and a large saving: the two together are 115M of the drafter's
-    # 121M parameters, leaving roughly 6M that actually has to be learned.
+    # A tensor absent from the checkpoint is one vLLM binds from the target instead, and it
+    # decides that per tensor: process_eagle_weight sets has_own_embed_tokens / has_own_lm_head
+    # from the names it sees, and _should_share consults each on its own.
+    #
+    # embed_tokens is the *input* side -- full vocabulary, frozen, identical to the target's --
+    # so it is shared whenever sharing is on, pruned head or not.  At 100,352 x 576 it is 57.8M
+    # parameters; shipping a copy alongside a pruned head made one drafter 80.6M instead of 22.8M.
+    #
+    # lm_head is the *output* side, and pruning changes it: a d2t head has len(vocab) rows and
+    # cannot be the target's full-size one, so it must ship. Without pruning it is identical to
+    # the target's and is shared.
     if not share_embeddings:
         tensors["embed_tokens.weight"] = cast(draft.embed_tokens.weight)
+    if not share_embeddings or vocab is not None:
         tensors["lm_head.weight"] = cast(draft.lm_head.weight)
-    elif vocab is not None:
-        raise ValueError(
-            "a pruned draft vocabulary needs its own lm_head, so pass share_embeddings=False "
-            "with vocab= (sharing binds the target's full-size head, which d2t cannot index).")
 
     if vocab is not None:
         ids = torch.as_tensor(np.asarray(vocab), dtype=torch.long)
