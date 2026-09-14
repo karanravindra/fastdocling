@@ -15,14 +15,16 @@ wheels/
 # Jupyter
 .ipynb_checkpoints/
 
-# Derived / large artifacts (regenerate with fastdocling-prep render / training)
+# Everything that is not code lives on the Hugging Face Hub (karanravindra/fastdocling-data,
+# karanravindra/fastdocling-traces). Sync with `uv run python scripts/sync_data.py pull|push`.
+data/docs/
 data/images/
 checkpoints/
 
 # Extracted hidden-state traces (~9 MB/page)
 data/traces/
 
-# Out-of-domain eval documents (fetch with scripts/fetch_ood.py, render with fastdocling-prep)
+# Out-of-domain eval documents (originally scripts/fetch_ood.py; now synced from the Hub)
 data/ood/
 
 # Cross-session caches (trained runs keyed by config, end-to-end greedy decodes keyed by page+draft)
