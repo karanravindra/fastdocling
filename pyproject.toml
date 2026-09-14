@@ -1,0 +1,32 @@
+[project]
+name = "fastdocling"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Karan Ravindra", email = "karan.ravindra@watts.ai" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.15.0",
+    "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git",
+    "datasets>=5.0.1",
+    "docling-core>=2.0.0",
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.9",
+    "matplotlib>=3.11.2",
+    "mlx-vlm>=0.4.0",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "tqdm>=4.70.1",
+    "transformers>=5.17.0",
+]
+
+[project.scripts]
+fastdocling = "fastdocling:main"
+fastdocling-prep = "fastdocling.prep:main"
+fastdocling-extract = "fastdocling.extract:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
