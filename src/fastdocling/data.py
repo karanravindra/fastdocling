@@ -59,9 +59,21 @@ def _read_header(path: Path) -> dict:
 
 
 def scan_traces(root: Path | str, min_completion: int = 1) -> list[TraceInfo]:
-    """Index every trace under ``root`` by reading only safetensors headers (fast, no tensor IO)."""
+    """Index every trace under ``root`` by reading only safetensors headers (fast, no tensor IO).
+
+    Raises rather than returning an empty corpus.  ``Path.glob`` on a directory that does not
+    exist yields nothing at all, so a mistyped path -- or a notebook run from a subdirectory,
+    where ``data/traces`` resolves relative to the *notebook*, not the repo -- used to surface
+    only much later as a ZeroDivisionError inside the acceptance metric, once the training loop
+    had silently iterated over nothing.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"no trace directory at {root.resolve()} (cwd {Path.cwd()}); paths are relative to "
+            "the working directory, so a notebook run from a subdirectory needs an absolute root")
     infos = []
-    for p in sorted(Path(root).glob("*.safetensors")):
+    for p in sorted(root.glob("*.safetensors")):
         h = _read_header(p)
         if "token_ids" not in h or "prompt_len" not in h:
             continue
@@ -81,6 +93,12 @@ def scan_traces(root: Path | str, min_completion: int = 1) -> list[TraceInfo]:
         info = TraceInfo(p, n, prompt_len, state_offset, has_taps="layer_2" in h)
         if info.completion_states >= min_completion:
             infos.append(info)
+    if not infos:
+        files = len(list(root.glob("*.safetensors")))
+        raise ValueError(
+            f"no usable traces in {root.resolve()}: {files} safetensors file(s) found, none with "
+            f"at least min_completion={min_completion} generated tokens"
+            + ("" if files else " -- run `fastdocling-extract` first"))
     return infos
 
 
@@ -219,6 +237,8 @@ def iterate_batches(
 def split(infos: Sequence[TraceInfo], holdout_fraction: float = 0.02, seed: int = 0) -> tuple[list[TraceInfo], list[TraceInfo]]:
     """Deterministic train/holdout split by page."""
     order = list(infos)
+    if len(order) < 2:
+        raise ValueError(f"need at least 2 pages to split, got {len(order)}")
     random.Random(seed).shuffle(order)
     k = max(1, int(len(order) * holdout_fraction))
     return order[k:], order[:k]
