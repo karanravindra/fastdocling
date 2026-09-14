@@ -63,17 +63,35 @@ class MLXLatentDraft(nn.Module):
         if in_dim is None:
             in_dim = sd["proj.weight"].shape[1] if "proj.weight" in sd else HIDDEN_SIZE
         model = cls(context_length, in_dim, horizon)
-        p = "transformer.layers.0."
+        # Two torch layouts map onto this one.  The current LatentDraft writes the block out by
+        # hand with these very names, so its state_dict needs no translation; checkpoints trained
+        # before that used nn.TransformerEncoderLayer, whose keys sit under transformer.layers.0
+        # and whose fused QKV is called self_attn.in_proj_weight.  Same tensors either way.
+        # MLX keeps the block flat; the torch model splits it into Attention and MLP
+        # submodules, and checkpoints trained before that used nn.TransformerEncoderLayer, whose
+        # keys sit under transformer.layers.0 with the fused QKV called self_attn.in_proj_weight.
+        # Same six tensors and two norms either way -- rename them onto the flat MLX paths.
+        if "transformer.layers.0.self_attn.in_proj_weight" in sd:
+            p_ = "transformer.layers.0."
+            alias = {"block.in_proj": p_ + "self_attn.in_proj", "block.out_proj": p_ + "self_attn.out_proj",
+                     "block.linear1": p_ + "linear1", "block.linear2": p_ + "linear2",
+                     "block.norm1": p_ + "norm1", "block.norm2": p_ + "norm2"}
+            # nn.MultiheadAttention stores the fused QKV as one flat name, not a submodule.
+            block = {"block.in_proj.weight": sd[p_ + "self_attn.in_proj_weight"],
+                     "block.in_proj.bias": sd[p_ + "self_attn.in_proj_bias"]}
+            block.update({f"{dst}.{t}": sd[f"{src_}.{t}"]
+                          for dst, src_ in alias.items() if dst != "block.in_proj" for t in ("weight", "bias")})
+        else:
+            alias = {"block.in_proj": "block.attn.in_proj", "block.out_proj": "block.attn.out_proj",
+                     "block.linear1": "block.mlp.linear1", "block.linear2": "block.mlp.linear2",
+                     "block.norm1": "block.norm1", "block.norm2": "block.norm2"}
+            missing = [f"{src_}.{t}" for src_ in alias.values() for t in ("weight", "bias") if f"{src_}.{t}" not in sd]
+            if missing:
+                raise KeyError(f"state_dict matches neither layout; missing {missing}")
+            block = {f"{dst}.{t}": sd[f"{src_}.{t}"] for dst, src_ in alias.items() for t in ("weight", "bias")}
         params = {
             "positions.weight": sd["positions.weight"],
-            "block.in_proj.weight": sd[p + "self_attn.in_proj_weight"],
-            "block.in_proj.bias": sd[p + "self_attn.in_proj_bias"],
-            "block.out_proj.weight": sd[p + "self_attn.out_proj.weight"],
-            "block.out_proj.bias": sd[p + "self_attn.out_proj.bias"],
-            "block.linear1.weight": sd[p + "linear1.weight"], "block.linear1.bias": sd[p + "linear1.bias"],
-            "block.linear2.weight": sd[p + "linear2.weight"], "block.linear2.bias": sd[p + "linear2.bias"],
-            "block.norm1.weight": sd[p + "norm1.weight"], "block.norm1.bias": sd[p + "norm1.bias"],
-            "block.norm2.weight": sd[p + "norm2.weight"], "block.norm2.bias": sd[p + "norm2.bias"],
+            **block,
             "norm.weight": sd["norm.weight"], "norm.bias": sd["norm.bias"],
             "future_heads.weight": sd["future_heads.weight"], "future_heads.bias": sd["future_heads.bias"],
         }
