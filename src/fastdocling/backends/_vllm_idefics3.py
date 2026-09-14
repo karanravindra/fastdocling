@@ -36,6 +36,29 @@ def __getattr__(name: str):
         class Idefics3Eagle3(Idefics3ForConditionalGeneration, SupportsEagle3):
             """Idefics3 that advertises EAGLE-3 aux hidden states."""
 
+            def get_language_model(self):
+                """Return the inner decoder, made to satisfy vLLM's eagle loader.
+
+                ``SupportsMultiModal.get_language_model`` resolves ``model.text_model`` and hands
+                back the ``LlamaModel`` *itself*, not a ``LlamaForCausalLM`` wrapping one.  vLLM
+                is inconsistent about that: ``SupportsEagle3.set_aux_hidden_state_layers`` guards
+                the access (``getattr(parent_ref, "model", parent_ref)``), but
+                ``v1/worker/gpu/spec_decode/eagle/utils.load_eagle_model`` does a bare
+                ``target_language_model.model`` and dies with "'LlamaModel' object has no
+                attribute 'model'" before a single weight is drafted.
+
+                Pointing ``model`` at the decoder itself is what that loader wants -- it only uses
+                it to reach ``embed_tokens`` for embedding sharing.  The assignment goes through
+                ``object.__setattr__`` on purpose: ``nn.Module.__setattr__`` would register the
+                decoder as a submodule of itself and send ``named_parameters``/``state_dict``
+                into infinite recursion.  Kept out of ``_modules``, it is invisible to everything
+                except attribute lookup.
+                """
+                language_model = super().get_language_model()
+                if "model" not in language_model.__dict__:
+                    object.__setattr__(language_model, "model", language_model)
+                return language_model
+
         globals()["Idefics3Eagle3"] = Idefics3Eagle3
         return Idefics3Eagle3
     raise AttributeError(name)
