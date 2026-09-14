@@ -18,3 +18,9 @@ wheels/
 # Derived / large artifacts (regenerate with fastdocling-prep render / training)
 data/images/
 checkpoints/
+
+# Extracted hidden-state traces (~9 MB/page)
+data/traces/
+
+# Out-of-domain eval documents (fetch with scripts/fetch_ood.py, render with fastdocling-prep)
+data/ood/

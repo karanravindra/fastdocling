@@ -24,7 +24,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import mlx.core as mx
 from mlx_vlm import batch_generate, load, stream_generate
@@ -39,7 +39,7 @@ from transformers.image_utils import load_image
 MODEL_ID = "ibm-granite/granite-docling-258M-mlx"
 PROMPT = "Convert this page to docling."
 MAX_NEW_TOKENS = 8192
-GEN_BATCH_SIZE = 8
+GEN_BATCH_SIZE = 16
 END_TAG = "</doctag>"
 END_TOKEN_ID = 100328  # "</doctag>"
 END_OF_UTTERANCE_ID = 100352
@@ -125,42 +125,46 @@ class TraceExtractor:
         mx.async_eval(next_ids, *taps.values())
         return caches, taps, next_ids
 
-    def generate_traces(self, images: Sequence[object], batch_size: int = GEN_BATCH_SIZE,
-                        max_tokens: int = MAX_NEW_TOKENS) -> list[dict]:
+    def generate_traces(self, images: Iterable[object], batch_size: int = GEN_BATCH_SIZE,
+                        max_tokens: int = MAX_NEW_TOKENS) -> Iterator[tuple[int, dict]]:
         """Greedy-decode pages with continuous batching, recording hidden states at every position.
 
-        Speed comes from three things: (1) rows share every decode step, so the model's weights
-        are read once per step for the whole batch; (2) finished rows are dropped and replaced
-        by freshly prefilled pages, so the batch stays full instead of draining to one row;
-        (3) tokens are read back one step behind the launch, so the GPU never waits on Python.
-        Prompts are grouped by length so a group prefills with no padding; BatchKVCache keeps
-        per-row offsets (and RoPE positions) once groups of different lengths share a batch.
+        Yields ``(index, trace)`` as pages finish (not in input order).  Each trace has the keys
+        used by ``train.ipynb`` plus ``doctags`` and ``truncated``.
 
-        Each result has the trace keys used by ``train.ipynb`` plus ``doctags`` and ``truncated``.
+        Speed comes from: (1) rows share every decode step, so weights are read once per step
+        for the whole batch; (2) finished rows are dropped and replaced by freshly prefilled
+        pages, so the batch stays full instead of draining to one row; (3) tokens are read back
+        one step behind the launch, so the GPU never waits on Python.  Pages are encoded lazily
+        as they are admitted, so ``images`` can be the whole corpus.  A refill group must share
+        one prompt length (no padding at prefill); sort inputs by image size to keep groups big.
         """
-        encoded = [self.encode_prompt(img) for img in images]
-        # queue grouped by prompt length, so every refill group is padding-free
-        order = sorted(range(len(encoded)), key=lambda i: encoded[i][0].shape[1])
-        queue = list(order)
+        it = iter(enumerate(images))
+        pending: list[tuple[int, mx.array, mx.array]] = []  # encoded but not yet admitted
         stop = {END_TOKEN_ID, self.processor.tokenizer.eos_token_id, END_OF_UTTERANCE_ID}
-
-        results: list[dict | None] = [None] * len(images)
-        rows: list[dict] = []  # active rows: {"i", "taps": {k: [..]}, "comp": [..]}
+        rows: list[dict] = []  # active rows: {"i", "ids", "taps": {k: [..]}, "comp": [..]}
         caches = None
         next_ids = None
 
         def admit():
             nonlocal caches, next_ids
             free = batch_size - len(rows)
-            if free <= 0 or not queue:
+            while len(pending) < free:
+                nxt = next(it, None)
+                if nxt is None:
+                    break
+                i, img = nxt
+                ids, emb = self.encode_prompt(img)
+                pending.append((i, ids, emb))
+            if not pending or free <= 0:
                 return
-            P = encoded[queue[0]][0].shape[1]
-            group = []
-            while queue and len(group) < free and encoded[queue[0]][0].shape[1] == P:
-                group.append(queue.pop(0))
-            new_caches, taps, ids = self._prefill([encoded[i] for i in group])
-            for local, i in enumerate(group):
-                rows.append({"i": i, "taps": {k: [v[local]] for k, v in taps.items()}, "comp": []})
+            P = pending[0][1].shape[1]
+            group = [e for e in pending[:free] if e[1].shape[1] == P]
+            for e in group:
+                pending.remove(e)
+            new_caches, taps, ids = self._prefill([(ids, emb) for _, ids, emb in group])
+            for local, (i, pid, _) in enumerate(group):
+                rows.append({"i": i, "ids": pid, "taps": {k: [v[local]] for k, v in taps.items()}, "comp": []})
             if caches is None:
                 caches, next_ids = new_caches, ids
             else:
@@ -168,9 +172,8 @@ class TraceExtractor:
                     c.extend(n)
                 next_ids = mx.concatenate([next_ids, ids])
 
-        def retire(row: dict):
-            i, comp = row["i"], row["comp"]
-            ids = encoded[i][0]
+        def retire(row: dict) -> dict:
+            ids, comp = row["ids"], row["comp"]
             trace = {k: mx.concatenate(v, axis=0).astype(mx.float16) for k, v in row["taps"].items()}
             trace["token_ids"] = mx.concatenate([ids[0], mx.array(comp, dtype=ids.dtype)])
             trace["prompt_len"] = mx.array([ids.shape[1]])
@@ -179,8 +182,7 @@ class TraceExtractor:
             text = self.processor.tokenizer.decode(comp, skip_special_tokens=False)
             trace["doctags"] = text[: text.index(END_TAG) + len(END_TAG)] if END_TAG in text else text
             trace["truncated"] = comp[-1] not in stop
-            results[i] = trace
-            encoded[i] = None  # free the prompt embeddings
+            return trace
 
         admit()
         while rows:
@@ -195,7 +197,7 @@ class TraceExtractor:
                 for k, v in taps.items():
                     row["taps"][k].append(v[local])
                 if tok in stop or len(row["comp"]) >= max_tokens:
-                    retire(row)
+                    yield row["i"], retire(row)
                 else:
                     keep.append(local)
             if len(keep) < len(rows):
@@ -208,7 +210,6 @@ class TraceExtractor:
                     caches = None
             next_ids = new_ids
             admit()
-        return results  # type: ignore[return-value]
 
     # -- per-page encoding ---------------------------------------------------------------
     def encode(self, image, doctags: str) -> tuple[mx.array, mx.array, int]:
@@ -329,18 +330,21 @@ def main(argv: list[str] | None = None) -> int:
                 mx.save_safetensors(str(args.out / f"{chunk[i]['name']}.safetensors"), trace)
                 bar.update()
     else:
-        # no labels: greedy-decode in batches and record the taps during decoding itself
-        for c0 in range(0, len(rows), args.gen_batch):
-            chunk = rows[c0 : c0 + args.gen_batch]
-            bar.set_postfix_str(f"gen x{len(chunk)} {chunk[0]['name'][-30:]}", refresh=True)
-            traces = ex.generate_traces([load_image(r["image"]) for r in chunk], args.gen_batch, args.max_tokens)
-            for r, tr in zip(chunk, traces):
-                (args.out / f"{r['name']}.dt").write_text(tr.pop("doctags"))
-                if tr.pop("truncated") and not args.keep_truncated:
-                    truncated += 1
-                    continue
+        # no labels: greedy-decode with continuous batching, recording taps during decoding.
+        # Prompt length depends only on image size, so sorting by size keeps refill groups full.
+        from PIL import Image
+
+        rows.sort(key=lambda r: Image.open(r["image"]).size)
+        images = (load_image(r["image"]) for r in rows)
+        for i, tr in ex.generate_traces(images, args.gen_batch, args.max_tokens):
+            r = rows[i]
+            (args.out / f"{r['name']}.dt").write_text(tr.pop("doctags"))
+            if tr.pop("truncated") and not args.keep_truncated:
+                truncated += 1
+            else:
                 mx.save_safetensors(str(args.out / f"{r['name']}.safetensors"), tr)
-            bar.update(len(chunk))
+            bar.set_postfix_str(r["name"][-30:], refresh=False)
+            bar.update()
     bar.close()
     if truncated:
         print(f"{truncated} pages skipped: no {END_TAG} within --max-tokens", file=sys.stderr)
