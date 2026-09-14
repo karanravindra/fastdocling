@@ -17,7 +17,7 @@ from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
 
-DEFAULT_REPO = "karan-wattsai/fastdocling-traces"
+DEFAULT_REPO = "karanravindra/fastdocling-traces"
 TRACES = Path("data/traces")
 
 
