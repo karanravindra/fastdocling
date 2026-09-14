@@ -36,7 +36,8 @@ from mlx_vlm.utils import load_config
 from tqdm import tqdm
 from transformers.image_utils import load_image
 
-MODEL_ID = "ibm-granite/granite-docling-258M-mlx"
+from .target import MODEL_ID
+
 PROMPT = "Convert this page to docling."
 MAX_NEW_TOKENS = 8192
 GEN_BATCH_SIZE = 16

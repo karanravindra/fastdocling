@@ -2,7 +2,7 @@
 
 Usage:
     fastdocling-prep compress data/docs            # downsample images to 150 dpi, in place
-    fastdocling-prep render   data/docs data/images  # PNGs at docling scale 2.0 (144 dpi)
+    fastdocling-prep render   data/docs data/images  # PNGs at docling scale 2.0 (144 dpi); skips rendered docs
     fastdocling-prep all      data/docs data/images  # both steps
 """
 
@@ -34,7 +34,7 @@ def _gs(args: list[str]) -> bool:
     return proc.returncode == 0
 
 
-def compress_pdf(pdf: Path, dpi: int) -> tuple[Path, bool]:
+def compress_pdf(pdf: Path, dpi: int) -> tuple[Path, str]:
     tmp = pdf.with_suffix(".gs_tmp.pdf")
     ok = _gs(
         [
@@ -55,37 +55,56 @@ def compress_pdf(pdf: Path, dpi: int) -> tuple[Path, bool]:
     )
     if ok and tmp.exists() and tmp.stat().st_size > 0:
         tmp.replace(pdf)
-        return pdf, True
+        return pdf, "ok"
     tmp.unlink(missing_ok=True)
-    return pdf, False
+    return pdf, "FAIL"
 
 
-def render_pdf(pdf: Path, docs_root: Path, out_root: Path, dpi: int) -> tuple[Path, bool]:
+def render_pdf(pdf: Path, docs_root: Path, out_root: Path, dpi: int, force: bool = False) -> tuple[Path, str]:
+    """Render one PDF to ``out_root/<rel>/%04d.png``.
+
+    A document whose output directory already holds PNGs is skipped (re-running ``render`` over a
+    corpus then only touches new PDFs).  Pages are rendered into a sibling temp directory that is
+    renamed into place on success, so a directory that exists is always a complete render.
+    Returns ``(pdf, status)`` with status ``"ok"``, ``"skip"`` or ``"FAIL"``.
+    """
     rel = pdf.relative_to(docs_root) if pdf.is_relative_to(docs_root) else Path(pdf.name)
     out_dir = out_root / rel.with_suffix("")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if not force and out_dir.is_dir() and any(out_dir.glob("*.png")):
+        return pdf, "skip"
+    tmp = out_dir.with_name(out_dir.name + ".rendering")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
     ok = _gs(
         [
             "-sDEVICE=png16m",
             f"-r{dpi}",
             "-dTextAlphaBits=4",
             "-dGraphicsAlphaBits=4",
-            f"-sOutputFile={out_dir / '%04d.png'}",
+            f"-sOutputFile={tmp / '%04d.png'}",
             str(pdf),
         ]
     )
-    return pdf, ok
+    ok = ok and any(tmp.glob("*.png"))   # gs can exit 0 without emitting a page; never replace output with nothing
+    if ok:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        tmp.replace(out_dir)
+    else:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return pdf, "ok" if ok else "FAIL"
 
 
 def _run(label: str, jobs, fn, workers: int) -> int:
-    failed = 0
+    failed = skipped = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(fn, *job) for job in jobs]
         for i, fut in enumerate(as_completed(futures), 1):
-            pdf, ok = fut.result()
-            status = "ok  " if ok else "FAIL"
-            failed += not ok
-            print(f"[{label}] {i}/{len(futures)} {status} {pdf.name}", file=sys.stderr)
+            pdf, status = fut.result()
+            failed += status == "FAIL"
+            skipped += status == "skip"
+            print(f"[{label}] {i}/{len(futures)} {status:4s} {pdf.name}", file=sys.stderr)
+    if skipped:
+        print(f"[{label}] {skipped} already done, skipped (use --force to redo)", file=sys.stderr)
     return failed
 
 
@@ -97,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--compress-dpi", type=int, default=150, help="image resolution for compress (default 150)")
     ap.add_argument("--render-dpi", type=int, default=DOCLING_DPI, help=f"render resolution (default {DOCLING_DPI} = docling scale {DOCLING_SCALE})")
     ap.add_argument("-j", "--jobs", type=int, default=8, help="parallel Ghostscript processes")
+    ap.add_argument("--force", action="store_true", help="re-render PDFs whose page images already exist")
     args = ap.parse_args(argv)
 
     if shutil.which("gs") is None:
@@ -113,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in ("compress", "all"):
         failed += _run("compress", [(p, args.compress_dpi) for p in pdfs], compress_pdf, args.jobs)
     if args.command in ("render", "all"):
-        failed += _run("render", [(p, docs_root, args.images, args.render_dpi) for p in pdfs], render_pdf, args.jobs)
+        failed += _run("render", [(p, docs_root, args.images, args.render_dpi, args.force) for p in pdfs], render_pdf, args.jobs)
 
     print(f"{len(pdfs)} PDFs processed, {failed} failures", file=sys.stderr)
     return 1 if failed else 0

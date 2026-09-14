@@ -15,7 +15,12 @@ With ``draft_fn=None`` the loop degenerates to plain greedy decoding, which is t
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import json
+import socket
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from time import perf_counter
 from typing import Callable, Sequence
 
@@ -45,6 +50,13 @@ class SpecResult:
     @property
     def tokens_per_round(self) -> float:
         return len(self.tokens) / self.rounds
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SpecResult":
+        return cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
 
 
 def _features(taps: dict[str, mx.array], keys: Sequence[str]) -> mx.array:
@@ -117,3 +129,48 @@ def speculative_generate(
         hist.append(n_acc)
     decode = perf_counter() - t0
     return SpecResult(tokens, prefill, decode, rounds, accepted_total, draft_seconds, hist)
+
+
+def _file_sha1(path: Path) -> str:
+    return hashlib.sha1(Path(path).read_bytes()).hexdigest()
+
+
+def cached_generate(
+    ex: TraceExtractor,
+    image_path: str | Path,
+    draft_fn: DraftFn | None,
+    *,
+    cache_dir: str | Path,
+    key: dict,
+    refresh: bool = False,
+    **generate_kwargs,
+) -> tuple[SpecResult, bool]:
+    """``speculative_generate`` on the page at ``image_path``, reusing a stored result when possible.
+
+    Decoding is greedy, so for a fixed (target, draft, page) the token output is deterministic and
+    re-running it after a kernel restart is pure waste (~5-60 s per page).  Results are stored as
+    JSON under ``cache_dir`` named by the sha1 of ``key`` + the image bytes.  ``key`` must identify
+    everything the output depends on: model id for a baseline; plus draft weights, horizon, window
+    and vocabulary for a speculative run.  Timings are stored as measured in whichever session ran
+    the decode (``measured_at``/``host`` are kept in the file); pass ``refresh=True`` to re-run.
+
+    Returns ``(result, hit)`` where ``hit`` says whether the result came from the cache.
+    """
+    from transformers.image_utils import load_image
+
+    image_path = Path(image_path)
+    cache_dir = Path(cache_dir)
+    digest = hashlib.sha1(json.dumps({**key, "image": _file_sha1(image_path)}, sort_keys=True, default=str).encode()).hexdigest()
+    path = cache_dir / f"{digest}.json"
+    if path.exists() and not refresh:
+        return SpecResult.from_dict(json.loads(path.read_text())["result"]), True
+    result = speculative_generate(ex, load_image(str(image_path)), draft_fn, **generate_kwargs)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({
+        "key": key, "image_path": str(image_path), "kwargs": {k: str(v) for k, v in generate_kwargs.items()},
+        "measured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "host": socket.gethostname(),
+        "result": result.to_dict(),
+    }))
+    tmp.replace(path)
+    return result, False

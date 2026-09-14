@@ -24,3 +24,6 @@ data/traces/
 
 # Out-of-domain eval documents (fetch with scripts/fetch_ood.py, render with fastdocling-prep)
 data/ood/
+
+# Cross-session caches (trained runs keyed by config, end-to-end greedy decodes keyed by page+draft)
+data/cache/

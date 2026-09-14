@@ -21,6 +21,7 @@ predicted the first DocTags token), never inside the image/prompt prefix.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import struct
@@ -242,3 +243,13 @@ def output_vocab(infos: Sequence[TraceInfo], cache: Path | None = None) -> np.nd
     if cache is not None:
         np.save(cache, vocab)
     return vocab
+
+
+def corpus_key(infos: Sequence[TraceInfo]) -> str:
+    """Short fingerprint of a page set (by file name), for caches that depend on which pages were used."""
+    return hashlib.sha1("\n".join(sorted(i.path.name for i in infos)).encode()).hexdigest()[:10]
+
+
+def key_of(**parts) -> str:
+    """Stable sha1 of a dict of identifying values (JSON, sorted keys); non-JSON values are str()'d."""
+    return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]
