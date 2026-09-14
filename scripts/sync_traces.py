@@ -3,9 +3,10 @@
     uv run python scripts/sync_traces.py push [--repo USER/fastdocling-traces]   # upload new/changed files
     uv run python scripts/sync_traces.py pull [--repo ...]                        # download into data/traces
 
-Push uses ``upload_large_folder``: resumable, parallel, skips files already on the Hub, and
-safe to re-run while ``fastdocling-extract`` is still producing pages (it only uploads files
-that exist and are unchanged between hash and upload).  The repo is created private if missing.
+Push uses ``upload_folder`` (hub >= 1.x): files are hashed and chunk-uploaded via Xet in one
+pass, committed in batches, and a re-run resumes by skipping already-committed files and
+deduplicating uploaded data.  Safe to re-run while ``fastdocling-extract`` is still producing
+pages.  The repo is created private if missing.
 Login once with ``hf auth login`` (or set HF_TOKEN).
 """
 
@@ -21,14 +22,15 @@ DEFAULT_REPO = "karanravindra/fastdocling-traces"
 TRACES = Path("data/traces")
 
 
-def push(repo: str, folder: Path, workers: int) -> None:
+def push(repo: str, folder: Path, workers: int) -> None:  # workers: unused (Xet manages parallelism)
     api = HfApi()
     api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
     n = sum(1 for _ in folder.glob("*.safetensors"))
     print(f"uploading {folder} ({n} pages) -> hf://datasets/{repo}", file=sys.stderr)
-    api.upload_large_folder(
+    api.upload_folder(
         repo_id=repo, repo_type="dataset", folder_path=str(folder),
-        allow_patterns=["*.safetensors", "*.dt", "*.npy"], num_workers=workers, print_report=True,
+        allow_patterns=["*.safetensors", "*.dt", "*.npy"],
+        commit_message=f"traces: {n} pages",
     )
 
 
