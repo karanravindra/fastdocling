@@ -1,8 +1,8 @@
 """Streaming dataset over traces written by ``fastdocling-extract``.
 
-Each trace is one page: ``token_ids[N]``, ``prompt_len``, and hidden states ``[N, 576]`` after
-layers 2/14/27 plus the final normed state.  The corpus is ~9 MB per page and tens of GB in
-total, so files are loaded one at a time and cut into fixed-length training windows.
+Each trace is one page: ``token_ids[N]``, ``prompt_len``, ``state_offset`` and hidden states for
+positions ``state_offset..N-1`` (the final normed state; layer_2/14/27 taps only if extracted
+with ``--keep-taps``).  Files are loaded one at a time and cut into fixed-length windows.
 
 Alignment: hidden state ``i`` is the target model's state *after reading* token ``i``; the
 target's own LM head turned it into token ``i+1``.  In speculative decoding that token is
@@ -42,6 +42,8 @@ class TraceInfo:
     path: Path
     n_tokens: int
     prompt_len: int
+    state_offset: int = 0      # position of the first stored hidden state
+    has_taps: bool = False
 
     @property
     def completion_states(self) -> int:
@@ -64,14 +66,18 @@ def scan_traces(root: Path | str, min_completion: int = 1) -> list[TraceInfo]:
             continue
         n = h["token_ids"]["shape"][0]
         # prompt_len is a 1-element tensor; read it from the file body cheaply
-        off = h["prompt_len"]["data_offsets"]
-        with open(p, "rb") as fh:
-            (hlen,) = struct.unpack("<Q", fh.read(8))
-            fh.seek(8 + hlen + off[0])
-            raw = fh.read(off[1] - off[0])
-        dtype = {"I32": "<i4", "I64": "<i8", "U32": "<u4"}[h["prompt_len"]["dtype"]]
-        prompt_len = int(np.frombuffer(raw, dtype=dtype)[0])
-        info = TraceInfo(p, n, prompt_len)
+        def scalar(key: str) -> int:
+            off = h[key]["data_offsets"]
+            with open(p, "rb") as fh:
+                (hlen,) = struct.unpack("<Q", fh.read(8))
+                fh.seek(8 + hlen + off[0])
+                raw = fh.read(off[1] - off[0])
+            dtype = {"I32": "<i4", "I64": "<i8", "U32": "<u4"}[h[key]["dtype"]]
+            return int(np.frombuffer(raw, dtype=dtype)[0])
+
+        prompt_len = scalar("prompt_len")
+        state_offset = scalar("state_offset") if "state_offset" in h else 0
+        info = TraceInfo(p, n, prompt_len, state_offset, has_taps="layer_2" in h)
         if info.completion_states >= min_completion:
             infos.append(info)
     return infos
@@ -82,15 +88,17 @@ def load_trace(info: TraceInfo, features: Features = "last") -> tuple[torch.Tens
     from safetensors.torch import load_file
 
     t = load_file(str(info.path))
-    s = info.prompt_len - 1
+    s = info.prompt_len - 1 - info.state_offset          # index into the stored states
     last = t["last_hidden_state"][s:].float()
     if features == "last":
         inputs = last
     elif features == "eagle3":
+        if not info.has_taps:
+            raise ValueError(f"{info.path.name} has no layer taps; re-extract with --keep-taps for eagle3 features")
         inputs = torch.cat([t[k][s:].float() for k in EAGLE3_TAPS], dim=-1)
     else:
         raise ValueError(features)
-    return inputs, last, t["token_ids"][s:].long()
+    return inputs, last, t["token_ids"][info.prompt_len - 1 :].long()
 
 
 def input_dim(features: Features) -> int:

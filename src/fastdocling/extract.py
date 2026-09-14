@@ -56,10 +56,35 @@ def eagle3_taps(num_layers: int) -> tuple[int, int, int]:
     return 2, n // 2 - 1, num_layers - 3
 
 
+def finalize_trace(trace: dict, prompt_len: int, keep_taps: bool = False) -> dict:
+    """Shrink a trace losslessly for training.
+
+    - States before ``prompt_len - 1`` belong to image/prompt tokens the loader never reads;
+      they are dropped and ``state_offset`` records where the stored states start.
+    - The EAGLE-3 taps (``layer_*``) are dropped unless ``keep_taps``; the final normed state is
+      what the current draft trains on.  ``token_ids`` stays complete (int64, tiny).
+    """
+    off = prompt_len - 1
+    out = {}
+    for k, v in trace.items():
+        if k.startswith("layer_"):
+            if keep_taps:
+                out[k] = v[off:]
+        elif k == "last_hidden_state":
+            out[k] = v[off:]
+        else:
+            out[k] = v
+    out["state_offset"] = mx.array([off])
+    return out
+
+
 class TraceExtractor:
     def __init__(self, model_id: str = MODEL_ID, prompt: str = PROMPT, taps: Sequence[int] | None = None,
-                 *, model=None, processor=None, config=None):
-        """Pass ``model``/``processor``/``config`` to reuse an already-loaded model."""
+                 *, model=None, processor=None, config=None, keep_taps: bool = False):
+        """Pass ``model``/``processor``/``config`` to reuse an already-loaded model.
+
+        ``keep_taps``: store the EAGLE-3 layer taps in traces (4x larger); off by default."""
+        self.keep_taps = keep_taps
         if model is None:
             model, processor = load(model_id)
             config = load_config(model_id)
@@ -178,6 +203,7 @@ class TraceExtractor:
             trace["token_ids"] = mx.concatenate([ids[0], mx.array(comp, dtype=ids.dtype)])
             trace["prompt_len"] = mx.array([ids.shape[1]])
             trace["completion_start"] = trace["prompt_len"]
+            trace = finalize_trace(trace, ids.shape[1], self.keep_taps)
             mx.eval(*trace.values())
             text = self.processor.tokenizer.decode(comp, skip_special_tokens=False)
             trace["doctags"] = text[: text.index(END_TAG) + len(END_TAG)] if END_TAG in text else text
@@ -266,7 +292,7 @@ class TraceExtractor:
                 t["token_ids"] = ids[0]
                 t["prompt_len"] = mx.array([prompt_len])
                 t["completion_start"] = t["prompt_len"]  # alias kept for train.ipynb
-                traces.append((i, t))
+                traces.append((i, finalize_trace(t, prompt_len, self.keep_taps)))
             # async_eval lets the GPU run this batch while Python pads the next one.
             mx.async_eval(*[v for _, t in traces for v in t.values()])
             for done in pending:
@@ -300,10 +326,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--chunk", type=int, default=16, help="pages per prefill sweep (manifest mode)")
     ap.add_argument("--max-tokens", type=int, default=MAX_NEW_TOKENS)
     ap.add_argument("--keep-truncated", action="store_true", help="keep pages that never emitted </doctag>")
+    ap.add_argument("--keep-taps", action="store_true", help="also store EAGLE-3 layer taps (layer_2/14/27); 4x larger traces")
     args = ap.parse_args(argv)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    ex = TraceExtractor(args.model)
+    ex = TraceExtractor(args.model, keep_taps=args.keep_taps)
 
     if args.source.suffix == ".jsonl":
         rows = _read_manifest(args.source)
