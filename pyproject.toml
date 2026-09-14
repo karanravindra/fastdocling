@@ -16,9 +16,8 @@ dependencies = [
     "ipykernel>=7.3.0",
     "ipywidgets>=8.1.9",
     "matplotlib>=3.11.2",
-    "mlx-vlm>=0.4.0",
-    "torch>=2.14.0",
-    "torchvision>=0.29.0",
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
     "tqdm>=4.70.1",
     "transformers>=5.17.0",
 ]
@@ -27,6 +26,21 @@ dependencies = [
 fastdocling = "fastdocling:main"
 fastdocling-prep = "fastdocling.prep:main"
 fastdocling-extract = "fastdocling.extract:main"
+
+# vLLM loads this in every process (including spawned workers), which is the only
+# hook that reaches the EngineCore that actually builds the model.
+[project.entry-points."vllm.general_plugins"]
+fastdocling_idefics3_eagle3 = "fastdocling.backends._vllm_idefics3:register"
+
+[project.optional-dependencies]
+# Backends are mutually exclusive: a machine is either Apple Silicon or CUDA.
+#   uv sync --extra mlx     (Mac)   torch 2.14 - measurably faster on Metal
+#   uv sync --extra cuda    (CUDA)  torch 2.13 - pinned exactly by vllm
+mlx = ["mlx-vlm>=0.4.0", "torch>=2.14.0", "torchvision>=0.29.0"]
+cuda = ["vllm>=0.18.0"]
+
+[tool.uv]
+conflicts = [[{ extra = "mlx" }, { extra = "cuda" }]]
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
