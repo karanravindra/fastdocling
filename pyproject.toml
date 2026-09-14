@@ -15,8 +15,11 @@ dependencies = [
     "huggingface-hub>=1.31.0",
     "ipykernel>=7.3.0",
     "ipywidgets>=8.1.9",
+    "jupyterlab>=4.0.0",
     "matplotlib>=3.11.2",
+    "scipy>=1.14.0",
     "torch>=2.13.0",
+    "torchinfo>=1.8.0",
     "torchvision>=0.28.0",
     "tqdm>=4.70.1",
     "transformers>=5.17.0",
@@ -31,6 +34,8 @@ fastdocling-extract = "fastdocling.extract:main"
 # hook that reaches the EngineCore that actually builds the model.
 [project.entry-points."vllm.general_plugins"]
 fastdocling_idefics3_eagle3 = "fastdocling.backends._vllm_idefics3:register"
+# Fixes vLLM 0.29's Medusa loader so a pruned (token_map) draft head can load at all.
+fastdocling_medusa_token_map = "fastdocling.backends._vllm_medusa:register"
 
 [project.optional-dependencies]
 # Backends are mutually exclusive: a machine is either Apple Silicon or CUDA.
