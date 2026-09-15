@@ -232,6 +232,14 @@ def export_eagle3_checkpoint(
         "tie_word_embeddings": False,
         "torch_dtype": str(dtype).removeprefix("torch."),
         # Tells the runner which target layers to tap, and the drafter how wide fc's input is.
+        # Top level, not just nested under eagle_config: vLLM's
+        # get_eagle3_aux_layers_from_config does a plain
+        # getattr(hf_config, "eagle_aux_hidden_state_layer_ids"), so a nested copy is invisible
+        # to it.  When it finds nothing it silently falls back to the *target's* defaults and
+        # logs "Using Eagle3 auxiliary layers from model" -- for granite-docling that is
+        # (2, 15, 27) against the (2, 14, 27) these traces were extracted and trained on, so the
+        # drafter is fed a layer it never saw.  Check the engine log says "from config".
+        "eagle_aux_hidden_state_layer_ids": list(aux_layers),
         "eagle_config": {"eagle_aux_hidden_state_layer_ids": list(aux_layers),
                          "use_aux_hidden_state": draft.use_aux_hidden_state},
         "num_aux_hidden_states": len(aux_layers),
