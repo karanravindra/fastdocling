@@ -11,52 +11,25 @@ for every accepted position so far (final normed state, or the EAGLE-3 tap conca
 up to ``horizon`` token ids.  An MLX draft (see ``draft_mlx``) returns a lazy array, so the
 draft, the target step and the acceptance test form one graph with a single eval per round.
 With ``draft_fn=None`` the loop degenerates to plain greedy decoding, which is the fair baseline.
+
+``SpecResult`` and ``cached_generate`` now live in ``fastdocling.decode.base`` and are shared with
+the transformers and vLLM decoders; they are re-exported here so existing imports keep working.
+Prefer ``fastdocling.decode.get_decoder`` for new code.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-import socket
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
 from time import perf_counter
 from typing import Callable, Sequence
 
 import mlx.core as mx
-import numpy as np
 from mlx_vlm.models.cache import KVCache
 
-from .extract import END_OF_UTTERANCE_ID, END_TOKEN_ID, TraceExtractor
+from .backends.base import END_OF_UTTERANCE_ID, END_TOKEN_ID
+from .backends.mlx_backend import TraceExtractor
+from .decode.base import SpecResult, cached_generate  # re-exported: these moved to `decode`
 
 DraftFn = Callable[[mx.array], "mx.array | list[int]"]
-
-
-@dataclass
-class SpecResult:
-    tokens: list[int]
-    prefill_seconds: float
-    decode_seconds: float
-    rounds: int                      # target decode steps (verifications)
-    accepted: int                    # draft tokens accepted
-    draft_seconds: float = 0.0
-    accepted_hist: list[int] = field(default_factory=list)
-
-    @property
-    def decode_tps(self) -> float:
-        return len(self.tokens) / self.decode_seconds
-
-    @property
-    def tokens_per_round(self) -> float:
-        return len(self.tokens) / self.rounds
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "SpecResult":
-        return cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
 
 
 def _features(taps: dict[str, mx.array], keys: Sequence[str]) -> mx.array:
@@ -128,49 +101,5 @@ def speculative_generate(
         accepted_total += n_acc
         hist.append(n_acc)
     decode = perf_counter() - t0
-    return SpecResult(tokens, prefill, decode, rounds, accepted_total, draft_seconds, hist)
-
-
-def _file_sha1(path: Path) -> str:
-    return hashlib.sha1(Path(path).read_bytes()).hexdigest()
-
-
-def cached_generate(
-    ex: TraceExtractor,
-    image_path: str | Path,
-    draft_fn: DraftFn | None,
-    *,
-    cache_dir: str | Path,
-    key: dict,
-    refresh: bool = False,
-    **generate_kwargs,
-) -> tuple[SpecResult, bool]:
-    """``speculative_generate`` on the page at ``image_path``, reusing a stored result when possible.
-
-    Decoding is greedy, so for a fixed (target, draft, page) the token output is deterministic and
-    re-running it after a kernel restart is pure waste (~5-60 s per page).  Results are stored as
-    JSON under ``cache_dir`` named by the sha1 of ``key`` + the image bytes.  ``key`` must identify
-    everything the output depends on: model id for a baseline; plus draft weights, horizon, window
-    and vocabulary for a speculative run.  Timings are stored as measured in whichever session ran
-    the decode (``measured_at``/``host`` are kept in the file); pass ``refresh=True`` to re-run.
-
-    Returns ``(result, hit)`` where ``hit`` says whether the result came from the cache.
-    """
-    from transformers.image_utils import load_image
-
-    image_path = Path(image_path)
-    cache_dir = Path(cache_dir)
-    digest = hashlib.sha1(json.dumps({**key, "image": _file_sha1(image_path)}, sort_keys=True, default=str).encode()).hexdigest()
-    path = cache_dir / f"{digest}.json"
-    if path.exists() and not refresh:
-        return SpecResult.from_dict(json.loads(path.read_text())["result"]), True
-    result = speculative_generate(ex, load_image(str(image_path)), draft_fn, **generate_kwargs)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({
-        "key": key, "image_path": str(image_path), "kwargs": {k: str(v) for k, v in generate_kwargs.items()},
-        "measured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "host": socket.gethostname(),
-        "result": result.to_dict(),
-    }))
-    tmp.replace(path)
-    return result, False
+    return SpecResult(tokens, prefill, decode, rounds, accepted_total, draft_seconds, hist,
+                      backend="mlx")

@@ -14,16 +14,33 @@ import torch
 
 MODEL_ID = "ibm-granite/granite-docling-258M-mlx"
 LM_HEAD_KEY = "language_model.lm_head.weight"
+EMBED_TOKENS_KEY = "language_model.embed_tokens.weight"
 
 
-def load_lm_head(model_id: str = MODEL_ID) -> torch.Tensor:
-    """The target's ``[vocab, 576]`` LM head as float32, without instantiating the model."""
+def _load_tensor(key: str, model_id: str = MODEL_ID) -> torch.Tensor:
+    """One tensor out of the target's cached safetensors, as float32."""
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
 
     path = hf_hub_download(model_id, "model.safetensors")
     with safe_open(path, framework="pt") as f:
-        return f.get_tensor(LM_HEAD_KEY).float()
+        return f.get_tensor(key).float()
+
+
+def load_lm_head(model_id: str = MODEL_ID) -> torch.Tensor:
+    """The target's ``[vocab, 576]`` LM head as float32, without instantiating the model."""
+    return _load_tensor(LM_HEAD_KEY, model_id)
+
+
+def load_embed_tokens(model_id: str = MODEL_ID) -> torch.Tensor:
+    """The target's ``[vocab, 576]`` input embedding as float32.
+
+    A draft trained on a *randomly initialised* embedding learns against an input space the served
+    model never presents: vLLM binds the target's own ``embed_tokens`` whenever the checkpoint
+    omits it (``_should_share``), which is exactly what ``export_eagle3_checkpoint`` does by
+    default.  Training and serving have to see the same table.
+    """
+    return _load_tensor(EMBED_TOKENS_KEY, model_id)
 
 
 @lru_cache(maxsize=1)

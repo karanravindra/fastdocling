@@ -137,6 +137,48 @@ class Eagle3Draft(nn.Module):
         return self.lm_head(self.norm(x))
 
 
+def init_from_target(draft: "Eagle3Draft", vocab: Sequence[int] | np.ndarray | None = None,
+                     model_id: str | None = None) -> "Eagle3Draft":
+    """Copy the target's embedding and LM head into ``draft``; returns ``draft``.
+
+    Both tensors are frozen during training, so nothing here is learned -- but leaving them at
+    their random initialisation is not neutral, it is wrong in two separate ways:
+
+    * ``embed_tokens`` is the drafter's *input*.  ``export_eagle3_checkpoint`` omits it, so vLLM
+      binds the target's own table at load time.  A drafter trained against a random table has
+      learned a map out of an input space the served model never presents.
+    * ``lm_head`` is the drafter's *output*.  With a pruned vocabulary the checkpoint must ship
+      its own head (``_should_share`` consults the two independently), so whatever sits in this
+      tensor at export time is what vLLM serves -- a random projection, if nothing loads it.
+
+    ``vocab`` is the sorted array of target token ids the pruned head spans; its rows are taken
+    from the target's head in that order, which is exactly the order ``d2t`` maps back.
+    """
+    from .target import MODEL_ID, load_embed_tokens, load_lm_head
+
+    model_id = model_id or MODEL_ID
+    with torch.no_grad():
+        embed = load_embed_tokens(model_id)
+        if embed.shape != draft.embed_tokens.weight.shape:
+            raise ValueError(f"target embedding is {tuple(embed.shape)} but the draft's is "
+                             f"{tuple(draft.embed_tokens.weight.shape)}")
+        draft.embed_tokens.weight.copy_(embed.to(draft.embed_tokens.weight.dtype))
+
+        head = load_lm_head(model_id)
+        if vocab is not None:
+            ids = torch.as_tensor(np.asarray(vocab), dtype=torch.long)
+            if ids.numel() != draft.draft_vocab_size:
+                raise ValueError(
+                    f"vocab has {ids.numel()} ids but the head has {draft.draft_vocab_size} rows; "
+                    "build the model with draft_vocab_size=len(vocab)")
+            head = head[ids]
+        elif head.shape[0] != draft.draft_vocab_size:
+            raise ValueError(f"target head has {head.shape[0]} rows but the draft's has "
+                             f"{draft.draft_vocab_size}; pass the pruned `vocab`")
+        draft.lm_head.weight.copy_(head.to(draft.lm_head.weight.dtype))
+    return draft
+
+
 def export_eagle3_checkpoint(
     draft: Eagle3Draft,
     out_dir: str | Path,
@@ -249,4 +291,4 @@ def export_eagle3_checkpoint(
 
 
 __all__ = ["HIDDEN_SIZE", "VOCAB_SIZE", "AUX_LAYERS", "RMSNorm", "Eagle3Layer", "Eagle3Draft",
-           "export_eagle3_checkpoint"]
+           "init_from_target", "export_eagle3_checkpoint"]

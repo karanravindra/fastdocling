@@ -14,7 +14,14 @@ Targets (default: all of them):
     images       data/images      rendered pages              -> .../fastdocling-data/images
     checkpoints  checkpoints      trained draft models        -> .../fastdocling-data/checkpoints
     cache        data/cache       trained runs, greedy decodes-> .../fastdocling-data/cache
+    prefill      data/prefill     borrowed-label pages+manifest-> .../fastdocling-data/prefill
     traces       data/traces      hidden-state traces (flat)  -> datasets/karanravindra/fastdocling-traces
+    traces_prefill data/traces_prefill  teacher-forced traces -> datasets/karanravindra/fastdocling-traces-prefill
+
+``traces`` and ``traces_prefill`` are separate repos on purpose: the first holds states recorded
+against the target's own greedy DocTags, the second against labels borrowed from a Hub dataset,
+which agree with the target for ~95% of tokens.  Mixing them in one repo would make it
+impossible to pull only the clean corpus.
 
 Push uses ``upload_folder`` (hub >= 1.x): files are hashed and chunk-uploaded via Xet, committed
 in batches, and a re-run resumes by skipping already-committed files.  Safe to re-run while
@@ -34,6 +41,7 @@ from huggingface_hub import HfApi, snapshot_download
 HF_USER = "karanravindra"
 DATA_REPO = f"{HF_USER}/fastdocling-data"
 TRACES_REPO = f"{HF_USER}/fastdocling-traces"
+PREFILL_TRACES_REPO = f"{HF_USER}/fastdocling-traces-prefill"
 
 
 @dataclass(frozen=True)
@@ -53,7 +61,11 @@ TARGETS = {
         Target("images", Path("data/images"), DATA_REPO, "images", ("**/*.png",)),
         Target("checkpoints", Path("checkpoints"), DATA_REPO, "checkpoints", ("**/*.pt", "**/*.npz", "**/*.safetensors", "**/*.json")),
         Target("cache", Path("data/cache"), DATA_REPO, "cache", ("**/*",)),
+        Target("prefill", Path("data/prefill"), DATA_REPO, "prefill",
+               ("**/*.png", "**/*.dt", "**/*.jsonl")),
         Target("traces", Path("data/traces"), TRACES_REPO, "", ("*.safetensors", "*.dt", "*.npy")),
+        Target("traces_prefill", Path("data/traces_prefill"), PREFILL_TRACES_REPO, "",
+               ("*.safetensors", "*.dt", "*.npy")),
     ]
 }
 

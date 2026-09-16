@@ -126,6 +126,7 @@ class VLLMBackend:
         self.taps = tuple(taps) if taps is not None else eagle3_taps(self.num_layers)
         self.aux_ids = aux_layer_ids(self.taps, self.num_layers)
 
+        self.max_model_len = max_model_len
         self.raw_prompt = prompt
         self.prompt = self.processor.apply_chat_template(
             [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}],

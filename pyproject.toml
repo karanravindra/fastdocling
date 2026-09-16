@@ -29,6 +29,7 @@ dependencies = [
 fastdocling = "fastdocling:main"
 fastdocling-prep = "fastdocling.prep:main"
 fastdocling-extract = "fastdocling.extract:main"
+fastdocling-pack = "fastdocling.data:main"
 
 # vLLM loads this in every process (including spawned workers), which is the only
 # hook that reaches the EngineCore that actually builds the model.
