@@ -1,8 +1,23 @@
-"""MLX port of the notebook's ``LatentDraft`` so the draft runs in the target's process.
+"""MLX ports of the drafts, so a draft runs inside the target's own process on Apple Silicon.
 
-Architecture mirrors ``torch.nn.TransformerEncoderLayer(norm_first=True, activation="gelu")``
-with one layer, a LayerNorm, learned absolute positions and ``horizon`` parallel heads.  Weights
-are loaded straight from the torch ``state_dict`` saved by ``train.ipynb``.
+Two drafts live here and they are different shapes, not variants:
+
+    MLXLatentDraft    one causal block over a window of final states -> ``horizon`` parallel
+                      heads, every offset predicted in a single forward pass
+    MLXEagle3Draft    one Llama-style decoder layer, autoregressive: propose a token, embed it,
+                      feed it back with the drafter's own KV cache, repeat
+
+``LatentDraft`` mirrors ``torch.nn.TransformerEncoderLayer(norm_first=True, activation="gelu")``.
+``Eagle3Draft`` mirrors ``fastdocling.eagle3``, which is in turn shaped by what vLLM hosts.
+Weights for both are loaded straight from the torch ``state_dict`` saved by ``train.ipynb``.
+
+**The EAGLE-3 draft here runs the function it was trained on, which is not the function vLLM
+serves.**  ``Eagle3Layer`` applies no rotary embedding; vLLM's drafter is a real
+``LlamaDecoderLayer``, whose ``LlamaAttention`` does ``q, k = self.rotary_emb(positions, q, k)``.
+So the weights were fit to un-rotated queries and keys and are then served rotated.  This port
+reproduces training, deliberately: it measures what the drafter is worth, and the distance to
+what vLLM measures is the cost of that mismatch rather than a property of the draft.  Fixing it
+means retraining with rotary applied, not patching this file.
 """
 
 from __future__ import annotations
@@ -136,10 +151,151 @@ def make_draft_fn(draft: MLXLatentDraft, lm_head: nn.Module, context_length: int
     if compile:
         propose = mx.compile(propose)
 
-    def draft_fn(features: mx.array) -> mx.array:
+    def draft_fn(features: mx.array, tokens: mx.array | None = None) -> mx.array:
+        # ``tokens`` is part of the DraftFn contract for EAGLE-3, which embeds the last accepted
+        # token; the latent draft reads the target's states alone and ignores it.
         win = features[-W:].astype(mx.float32)
         T = win.shape[0]
         if T < W:
             win = mx.pad(win, ((0, W - T), (0, 0)))
         return propose(win, mx.array(T - 1))
+    return draft_fn
+
+
+# ---------------------------------------------------------------------------------------
+# EAGLE-3
+# ---------------------------------------------------------------------------------------
+# Module and attribute names mirror ``fastdocling.eagle3`` exactly, so a torch state_dict loads
+# by its own key names with no rename table -- unlike the latent draft above, which has two
+# historical layouts to reconcile.
+
+DRAFT_WINDOW = 128      # positions of history the drafter re-reads each round (training context)
+
+
+class _Eagle3Layer(nn.Module):
+    """One decoder layer with EAGLE-3's doubled attention input; see ``eagle3.Eagle3Layer``."""
+
+    def __init__(self, hidden: int = HIDDEN_SIZE, heads: int = 9, kv_heads: int = 3,
+                 head_dim: int = 64, intermediate: int = 1536, eps: float = 1e-5):
+        super().__init__()
+        self.heads, self.kv_heads, self.head_dim = heads, kv_heads, head_dim
+        self.scale = head_dim ** -0.5
+        self.input_layernorm = nn.RMSNorm(hidden, eps)
+        self.hidden_norm = nn.RMSNorm(hidden, eps)
+        self.post_attention_layernorm = nn.RMSNorm(hidden, eps)
+        self.q_proj = nn.Linear(2 * hidden, heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(2 * hidden, kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(2 * hidden, kv_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(heads * head_dim, hidden, bias=False)
+        self.gate_proj = nn.Linear(hidden, intermediate, bias=False)
+        self.up_proj = nn.Linear(hidden, intermediate, bias=False)
+        self.down_proj = nn.Linear(intermediate, hidden, bias=False)
+
+    def attend(self, embeds: mx.array, hidden_states: mx.array, past=None):
+        """``(x, (k, v))`` -- the layer output before the final norm, and the KV to cache."""
+        residual = hidden_states
+        x = mx.concatenate([self.input_layernorm(embeds), self.hidden_norm(hidden_states)], axis=-1)
+
+        B, T, _ = x.shape
+        shape = lambda t, n: t.reshape(B, T, n, self.head_dim).transpose(0, 2, 1, 3)
+        q = shape(self.q_proj(x), self.heads)
+        k, v = shape(self.k_proj(x), self.kv_heads), shape(self.v_proj(x), self.kv_heads)
+        if past is not None:
+            k, v = mx.concatenate([past[0], k], axis=2), mx.concatenate([past[1], v], axis=2)
+        present = (k, v)
+        # mx.repeat, not SDPA's own grouped-query path: repeat_interleave is what the torch model
+        # trained with, and query head i reading kv head i // rep is the same mapping either way.
+        rep = self.heads // self.kv_heads
+        kr, vr = mx.repeat(k, rep, axis=1), mx.repeat(v, rep, axis=1)
+        # One query with a cache attends to all of it, itself included -- no mask.  More than one
+        # means the window prefill, which is causal.
+        a = mx.fast.scaled_dot_product_attention(q, kr, vr, scale=self.scale,
+                                                 mask="causal" if T > 1 else None)
+        hidden_states = residual + self.o_proj(a.transpose(0, 2, 1, 3).reshape(B, T, -1))
+
+        y = self.post_attention_layernorm(hidden_states)
+        return hidden_states + self.down_proj(nn.silu(self.gate_proj(y)) * self.up_proj(y)), present
+
+
+class MLXEagle3Draft(nn.Module):
+    """``fc`` over the target's taps, one decoder layer, a final norm.
+
+    The embedding and the vocabulary projection are deliberately *not* here.  Both are frozen
+    copies of the target's own tensors, and the target is already resident in this process --
+    holding a second float32 copy of a 100,352 x 576 table would cost more than the rest of the
+    draft put together.  ``make_eagle3_draft_fn`` borrows them.
+    """
+
+    def __init__(self, in_dim: int = HIDDEN_SIZE * 3, hidden: int = HIDDEN_SIZE, heads: int = 9,
+                 kv_heads: int = 3, head_dim: int = 64, intermediate: int = 1536,
+                 eps: float = 1e-5):
+        super().__init__()
+        self.fc = nn.Linear(in_dim, hidden, bias=False) if in_dim != hidden else None
+        self.layer = _Eagle3Layer(hidden, heads, kv_heads, head_dim, intermediate, eps)
+        self.norm = nn.RMSNorm(hidden, eps)
+
+    def combine(self, aux_states: mx.array) -> mx.array:
+        """The target's concatenated taps -> ``hidden``.  Applied to target states only: a state
+        the drafter fed back to itself is already this wide and must not pass through ``fc``."""
+        return self.fc(aux_states) if self.fc is not None else aux_states
+
+    @classmethod
+    def from_torch(cls, state_dict: Mapping[str, object], dtype=mx.float32) -> "MLXEagle3Draft":
+        sd = {k: mx.array(np.asarray(v.detach().cpu().float().numpy() if hasattr(v, "detach") else v))
+              for k, v in state_dict.items()
+              if not k.startswith(("embed_tokens", "lm_head"))}
+        missing = [k for k in ("fc.weight", "norm.weight", "layer.q_proj.weight") if k not in sd]
+        if missing:
+            raise KeyError(f"state_dict is not an Eagle3Draft; missing {missing}")
+        model = cls(in_dim=sd["fc.weight"].shape[1])
+        model.load_weights([(k, v.astype(dtype)) for k, v in sd.items()])
+        mx.eval(model.parameters())
+        return model
+
+
+def make_eagle3_draft_fn(draft: MLXEagle3Draft, embed_tokens, lm_head, *, horizon: int,
+                         window: int = DRAFT_WINDOW, vocab=None, compile: bool = True):
+    """Adapter for ``speculative_generate``: (features[T, D], tokens[T]) -> ids[horizon], lazy.
+
+    Nothing is evaluated here.  The k proposal steps, the target's verification step and the
+    acceptance test all land in one graph with a single sync per round, which is the property
+    the MLX path exists to preserve -- ``.item()`` anywhere in this loop would cost more than
+    the draft does.
+
+    ``vocab`` is the array of target ids the pruned head spans.  The projection is the target's
+    own head restricted to those rows -- identical to the draft's frozen ``lm_head``, at no extra
+    memory -- and a proposal is mapped back to a target id *before* being embedded, because
+    ``embed_tokens`` is indexed by target ids.
+    """
+    head_w = lm_head.weight if hasattr(lm_head, "weight") else lm_head
+    ids = None
+    if vocab is not None:
+        ids = mx.array(np.asarray(vocab, dtype=np.int64))
+        head_w = head_w[ids]
+        mx.eval(head_w)
+
+    def propose(features: mx.array, tokens: mx.array) -> mx.array:
+        x, past = draft.layer.attend(embed_tokens(tokens)[None].astype(mx.float32),
+                                     draft.combine(features[None].astype(mx.float32)))
+        out = []
+        for _ in range(horizon):
+            vec = draft.norm(x[:, -1:]).astype(head_w.dtype)
+            best = (vec @ head_w.T).argmax(-1)                  # [1, 1] draft ids
+            token = mx.take(ids, best) if ids is not None else best
+            out.append(token)
+            if len(out) < horizon:
+                x, past = draft.layer.attend(embed_tokens(token).astype(mx.float32),
+                                             x[:, -1:], past)
+        return mx.concatenate(out, axis=-1)[0]
+
+    # Compile only the full-window shape.  A short history cannot simply be padded to it: pads
+    # after the last real position would be *before* the queries appended in later steps, which
+    # attend to the whole cache, so the drafter would read them.  Early rounds run uncompiled
+    # instead, and every round from the window onwards is one fixed shape.
+    fast = mx.compile(propose) if compile else propose
+
+    def draft_fn(features: mx.array, tokens: mx.array) -> mx.array:
+        if features.shape[0] >= window:
+            return fast(features[-window:], tokens[-window:])
+        return propose(features, tokens)
     return draft_fn

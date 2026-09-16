@@ -51,6 +51,48 @@ class MLXDecoder:
         self._draft_fn = make_draft_fn(mlx_draft, self.extractor.lm.lm_head, context_length,
                                        window=window, vocab=vocab)
 
+    def attach_eagle3_draft(self, draft: Any, *, horizon: int, window: int | None = None,
+                            vocab: Any = None) -> None:
+        """Port a trained EAGLE-3 draft into MLX and build its autoregressive proposer.
+
+        ``draft`` is a torch ``Eagle3Draft``, its ``state_dict``, or the path to a checkpoint --
+        a checkpoint being the usual case on a Mac, where the drafter was trained elsewhere.  A
+        checkpoint carries its own ``vocab``, so passing one explicitly is only for overriding it.
+
+        The embedding and the vocabulary projection are taken from the target already resident in
+        this process rather than from the checkpoint.  They are frozen copies of the target's own
+        tensors, so this is the same function with one copy instead of two -- which is also why
+        the slim checkpoints omit them.
+
+        Generation must then be asked for the taps this drafter's ``fc`` expects:
+        ``generate(..., feature_keys=FEATURE_KEYS_EAGLE3)``.  Passing the default single final
+        state would feed a 576-d vector to a 1728-d projection and fail loudly.
+        """
+        from pathlib import Path
+
+        from ..draft_mlx import DRAFT_WINDOW, MLXEagle3Draft, make_eagle3_draft_fn
+
+        if isinstance(draft, (str, Path)):
+            import torch
+
+            ckpt = torch.load(draft, map_location="cpu")
+            state, ckpt_vocab = ckpt["state_dict"], ckpt.get("vocab")
+        elif hasattr(draft, "state_dict"):
+            state, ckpt_vocab = draft.state_dict(), None
+        else:
+            state, ckpt_vocab = draft, None
+        vocab = ckpt_vocab if vocab is None else vocab
+        if vocab is None and "lm_head.weight" in state and \
+                state["lm_head.weight"].shape[0] != self.extractor.lm.lm_head.weight.shape[0]:
+            raise ValueError(
+                "this draft has a pruned head but no vocabulary, so its rows cannot be mapped "
+                "back to target token ids; pass vocab= or use a checkpoint that carries one")
+
+        mlx_draft = MLXEagle3Draft.from_torch(state)
+        self._draft_fn = make_eagle3_draft_fn(
+            mlx_draft, self.extractor.lm.embed_tokens, self.extractor.lm.lm_head,
+            horizon=horizon, window=DRAFT_WINDOW if window is None else window, vocab=vocab)
+
     def generate(self, image, *, use_draft: bool, horizon: int = 2,
                  feature_keys: Sequence[str] = FEATURE_KEYS_LAST,
                  history_limit: int | None = 256, max_tokens: int = 8192) -> SpecResult:

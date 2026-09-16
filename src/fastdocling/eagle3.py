@@ -84,7 +84,15 @@ class Eagle3Layer(nn.Module):
         self.up_proj = nn.Linear(hidden, intermediate, bias=False)
         self.down_proj = nn.Linear(intermediate, hidden, bias=False)
 
-    def forward(self, embeds: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    def attend(self, embeds: torch.Tensor, hidden_states: torch.Tensor,
+               past: tuple[torch.Tensor, torch.Tensor] | None = None,
+               ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """``(x, (k, v))``: the layer output *before* the final norm, and the KV to cache.
+
+        ``past`` extends the keys and values this call attends over, which is what makes the
+        proposal loop autoregressive.  Attention is causal exactly when there is more than one
+        query -- a single query with a cache attends to all of it, including itself.
+        """
         residual = hidden_states
         x = torch.cat([self.input_layernorm(embeds), self.hidden_norm(hidden_states)], dim=-1)
 
@@ -92,15 +100,21 @@ class Eagle3Layer(nn.Module):
         q = self.q_proj(x).view(B, T, self.heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.kv_heads, self.head_dim).transpose(1, 2)
+        if past is not None:
+            k, v = torch.cat([past[0], k], dim=2), torch.cat([past[1], v], dim=2)
+        present = (k, v)
         # Grouped-query attention: vLLM repeats KV heads internally; do the same here so training
         # and the served model compute the same function.
         rep = self.heads // self.kv_heads
-        k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
-        a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        kr, vr = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
+        a = F.scaled_dot_product_attention(q, kr, vr, is_causal=T > 1)
         hidden_states = residual + self.o_proj(a.transpose(1, 2).reshape(B, T, -1))
 
         y = self.post_attention_layernorm(hidden_states)
-        return hidden_states + self.down_proj(F.silu(self.gate_proj(y)) * self.up_proj(y))
+        return hidden_states + self.down_proj(F.silu(self.gate_proj(y)) * self.up_proj(y)), present
+
+    def forward(self, embeds: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.attend(embeds, hidden_states)[0]
 
 
 class Eagle3Draft(nn.Module):
@@ -135,6 +149,46 @@ class Eagle3Draft(nn.Module):
         hidden = self.fc(aux_states) if self.fc is not None else aux_states
         x = self.layer(self.embed_tokens(input_ids), hidden)
         return self.lm_head(self.norm(x))
+
+    @torch.inference_mode()
+    def propose(self, aux_states: torch.Tensor, input_ids: torch.Tensor, horizon: int,
+                vocab: torch.Tensor | None = None) -> torch.Tensor:
+        """``([T, in_dim], [T]) -> [horizon]`` token ids, drafted one at a time.
+
+        This is what ``forward`` is the teacher-forced view of, and the two diverge after the
+        first token by design.  Position ``T-1`` is drafted from the target's own state and the
+        target's own last token, so proposal 1 is exactly ``forward``'s argmax there.  Every
+        proposal after that has no target state to stand on: the drafter feeds back *its own*
+        pre-norm output and *its own* previous guess, and attends over its own KV cache.  So
+        acceptance decays with the slot index, and a teacher-forced accuracy is an upper bound
+        on the first slot only.
+
+        Three details are vLLM's, not ours, and getting any of them wrong changes what is served
+        (``v1/worker/gpu/spec_decode/autoregressive/speculator.py``):
+
+        * ``fc`` combines the *target's* taps and is applied once, at the window.  A fed-back
+          state is already ``hidden_size`` wide and must not go through it again.
+        * the feedback is the layer output *before* the final norm -- vLLM returns
+          ``(hidden_states, aux_output)`` and writes ``aux_output``, which is ``hidden_prenorm``
+          unless ``norm_output`` is set, into the next step's hidden-state buffer.
+        * ``vocab`` maps a draft row back to a target id (the ``d2t`` offset table in export
+          form).  The mapping has to happen *before* the id is embedded, because ``embed_tokens``
+          is the target's full-vocabulary table.
+
+        Note that no rotary embedding is applied here, matching how this drafter was trained.
+        vLLM's ``LlamaAttention`` does apply one, so a checkpoint served there is not running
+        the function it learned; see the module docstring of ``draft_mlx``.
+        """
+        hidden = self.fc(aux_states[None]) if self.fc is not None else aux_states[None]
+        x, past = self.layer.attend(self.embed_tokens(input_ids[None]), hidden)
+        out = []
+        for _ in range(horizon):
+            draft_id = self.lm_head(self.norm(x[:, -1:])).argmax(-1)      # [1, 1]
+            token = vocab[draft_id] if vocab is not None else draft_id
+            out.append(token)
+            if len(out) < horizon:
+                x, past = self.layer.attend(self.embed_tokens(token), x[:, -1:], past)
+        return torch.cat(out, dim=-1)[0]
 
 
 def init_from_target(draft: "Eagle3Draft", vocab: Sequence[int] | np.ndarray | None = None,
