@@ -300,9 +300,31 @@ def iterate_batches(
 # already store, so packing is a copy rather than a rounding.  Neither dtype moves fewer bytes;
 # both are two.  The taps peak at |544| against float16's 65504 ceiling (checked over 40 pages,
 # no inf/nan), so the range bfloat16 would buy is range this corpus never uses.
+#
+# *How* the array is written turned out to cost more than any of that.  The build is a sequential
+# append -- pages are visited in offset order and nothing is ever revisited -- but it used to be
+# expressed as stores into an open_memmap of the finished size, on the same ZFS pool the traces
+# are read from.  That pool is spinning disks, so the build was competing with itself for seeks:
+# each store dirtied a page of a sparse file that ZFS then had to read-modify-write back, between
+# the reads it was trying to stream.  Measured over 300 cold pages (1.35 GB of traces), against a
+# read-only ceiling of 163 MB/s on this corpus:
+#
+#     memmap of the full size, onto the pool      42 MB/s of traces consumed   (31.8 s)
+#     buffered sequential append, onto the pool   79 MB/s                      (17.3 s)
+#     buffered sequential append, onto the NVMe  154 MB/s                      (10.1 s)
+#
+# So: write the rows out with ordinary buffered writes, and put `out_dir` on a different device
+# from the traces.  Together that is ~6 min for the 60.7 GB corpus rather than ~24, and what is
+# left is the disk the traces are on -- a warm (ARC-cached) build of the same 300 pages runs at
+# 1478 MB/s, so nothing above that line is CPU.
+#
+# Do not reach for threads to close the remaining gap: 8 of them reading pages concurrently
+# measured 43 MB/s against the single stream's 163.  These are HDDs, and concurrent readers turn
+# one sequential stream into eight seeking ones.
 # ---------------------------------------------------------------------------------------
 
 PACK_VERSION = 2
+WRITE_BUFFER = 8 << 20    # a page is ~4 MB of rows; coalesce the short ones into 8 MiB writes
 
 
 def page_key(info: TraceInfo) -> str:
@@ -380,6 +402,10 @@ def pack_traces(infos: Sequence[TraceInfo], out_dir: Path | str, features: Featu
     """Write ``infos`` into a packed corpus under ``out_dir`` and return it.
 
     ``progress`` is called as ``progress(done, total)`` if given.  Overwrites any existing pack.
+
+    ``out_dir`` wants to be on a *different* device from the traces where there is one to spare:
+    the build is read-bound on the trace disk, and sharing a spindle with the 45 GB it is writing
+    costs more than half the throughput (see the section comment above).
     """
     from safetensors import safe_open
 
@@ -392,58 +418,86 @@ def pack_traces(infos: Sequence[TraceInfo], out_dir: Path | str, features: Featu
     key, content = corpus_key(infos), _content_key(infos)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build into temporaries and rename into place.  Writing taps.npy directly would truncate the
-    # file a previously returned PackedCorpus still has mapped, and the next read through that
-    # mapping faults with SIGBUS; a rename leaves the old inode alive for as long as it is mapped.
-    # Dropping the metadata first means a build that dies halfway leaves no loadable pack behind.
+    # Build into temporaries and rename into place, so a build that dies halfway leaves no partial
+    # taps.npy under the name the next load_packed will open.  Dropping the metadata first means
+    # it leaves no loadable pack behind either.
     _pack_meta(out_dir).unlink(missing_ok=True)
+    # With pack.json gone the previous build's rows are already unreachable, so unlink them now
+    # rather than at the rename: a rebuild otherwise needs room for two packs at once, and the
+    # disk worth writing this one to is the small fast one (45.4 GB of pack against 69 GB free).
+    # unlink, not truncate -- a PackedCorpus someone still holds keeps its own inode, and its
+    # rows, alive until it is closed, which is the SIGBUS the rename dance exists to avoid.
+    for name in ("taps", "tokens", "starts", "names"):
+        (out_dir / f"{name}.npy").unlink(missing_ok=True)
+
+    # Better to say so now than to run out at 80% of a six-minute build and leave the caller with
+    # neither the old pack nor a new one.  If a live PackedCorpus is still holding the previous
+    # build open its bytes are not free yet, which is the usual reason this fires in a notebook.
+    need = total * dim * 2 + total * 4 + (len(infos) + 1) * 8
+    free = shutil.disk_usage(out_dir).free
+    if free < need:
+        raise OSError(
+            f"{out_dir} has {free / 1e9:.1f} GB free but the pack needs {need / 1e9:.1f} GB; "
+            f"point out_dir at a larger disk, or drop any PackedCorpus still open on the "
+            f"previous build (its rows are held until the last reference goes away)")
+
     staging = out_dir / ".building"
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir()
-    taps = None
     try:
-        taps = np.lib.format.open_memmap(staging / "taps.npy", mode="w+", dtype=np.float16,
-                                         shape=(total, dim))
         tokens = np.zeros(total, dtype=np.int32)
         starts = np.zeros(len(infos) + 1, dtype=np.int64)
         off = 0
-        for n, info in enumerate(infos):
-            if features == "eagle3" and not info.has_taps:
-                raise ValueError(f"{info.path.name} has no layer taps; re-extract with --keep-taps")
-            # safe_open, not load_file: the eagle3 pack wants three of the four stored tensors,
-            # and materialising last_hidden_state too read ~33% more bytes than the build needs.
-            with safe_open(str(info.path), framework="np") as f:
-                first = info.prompt_len - 1 - info.state_offset
-                block = np.concatenate([f.get_slice(k)[first:] for k in keys], axis=-1)
-                tok = f.get_slice("token_ids")[info.prompt_len - 1 :]
-            # completion_states is derived from the header, so a disagreement here means the file
-            # itself is malformed.  Clamping instead would leave off < total, and a pack whose row
-            # count disagrees with its metadata is one load_packed rejects forever -- the failure
-            # would be a permanently poisoned cache rather than a named bad file.
-            if not block.shape[0] == tok.shape[0] == info.completion_states:
-                raise ValueError(
-                    f"{info.path.name} is malformed: {block.shape[0]} stored states and "
-                    f"{tok.shape[0]} tokens in the DocTags region, but its header implies "
-                    f"{info.completion_states}; re-extract this page")
-            starts[n] = off
-            taps[off : off + block.shape[0]] = block
-            tokens[off : off + tok.shape[0]] = tok
-            off += block.shape[0]
-            if progress is not None:
-                progress(n + 1, len(infos))
+        # Stream the rows out in order rather than storing into a memmap: pages are visited in
+        # offset order, so the whole array is one sequential append and nothing needs a mapping.
+        # Writing the header by hand is what lets the file be opened before its contents exist --
+        # it is the same header open_memmap would have written, shape included, and `off != total`
+        # below is what guarantees the body matches it.
+        with open(staging / "taps.npy", "wb", buffering=WRITE_BUFFER) as fh:
+            np.lib.format.write_array_header_1_0(
+                fh, {"descr": np.lib.format.dtype_to_descr(np.dtype(np.float16)),
+                     "fortran_order": False, "shape": (total, dim)})
+            for n, info in enumerate(infos):
+                if features == "eagle3" and not info.has_taps:
+                    raise ValueError(
+                        f"{info.path.name} has no layer taps; re-extract with --keep-taps")
+                # safe_open, not load_file: the eagle3 pack wants three of the four stored tensors,
+                # and materialising last_hidden_state too read ~33% more bytes than the build needs.
+                with safe_open(str(info.path), framework="np") as f:
+                    first = info.prompt_len - 1 - info.state_offset
+                    block = np.concatenate([f.get_slice(k)[first:] for k in keys], axis=-1)
+                    tok = f.get_slice("token_ids")[info.prompt_len - 1 :]
+                # completion_states is derived from the header, so a disagreement here means the
+                # file itself is malformed.  Clamping instead would leave off < total, and a pack
+                # whose row count disagrees with its metadata is one load_packed rejects forever --
+                # the failure would be a permanently poisoned cache rather than a named bad file.
+                if not block.shape[0] == tok.shape[0] == info.completion_states:
+                    raise ValueError(
+                        f"{info.path.name} is malformed: {block.shape[0]} stored states and "
+                        f"{tok.shape[0]} tokens in the DocTags region, but its header implies "
+                        f"{info.completion_states}; re-extract this page")
+                starts[n] = off
+                fh.write(np.ascontiguousarray(block, dtype=np.float16))
+                tokens[off : off + tok.shape[0]] = tok
+                off += block.shape[0]
+                if progress is not None:
+                    progress(n + 1, len(infos))
         starts[len(infos)] = off
+        # The header promised `total` rows and the file is now closed, so a short build has to be
+        # caught here: every page was already checked against its own header, which leaves only a
+        # `total` that disagrees with the infos actually walked.
+        if off != total:
+            raise ValueError(f"packed {off} positions but sized the file for {total}")
 
-        taps.flush()
-        taps = None                       # drop the mapping before renaming the file under it
         np.save(staging / "tokens.npy", tokens[:off])
         np.save(staging / "starts.npy", starts)
         np.save(staging / "names.npy", np.array([page_key(i) for i in infos]))
         for name in ("taps", "tokens", "starts", "names"):
             os.replace(staging / f"{name}.npy", out_dir / f"{name}.npy")
     finally:
-        # Without this a failed build leaves the full-size .building/taps.npy behind -- 10.3 GB on
-        # the real corpus -- plus a live mapping of it held by the traceback frame.
-        del taps
+        # Without this a failed build leaves a partial .building/taps.npy behind.  It is no longer
+        # the full 45 GB -- a streamed file is only as long as the rows already written -- but it
+        # is still large enough to matter on a disk sized for exactly one pack.
         shutil.rmtree(staging, ignore_errors=True)
 
     _pack_meta(out_dir).write_text(json.dumps(
